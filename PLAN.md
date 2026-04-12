@@ -154,10 +154,10 @@ Offline ingestion (scheduled script, weekly)
 
 ### v0.1 — "ugly but shipped" (target: end of week 3)
 
-- [ ] Git repo created, Next.js bootstrapped, pushed to GitHub ✅
+- [x] Git repo created, Next.js bootstrapped, pushed to GitHub
 - [ ] Basic chat UI (textarea + button + message list — no streaming, no styling)
 - [ ] Initial corpus: 30 URLs fetched and stored as Markdown snapshots *(5 done)*
-- [ ] Ingestion script that chunks + embeds + upserts to Supabase pgvector
+- [x] Ingestion script that chunks + embeds + upserts to Supabase pgvector *(214 chunks, 3072-dim vectors)*
 - [ ] `/api/chat` route: embed question → top-5 chunks → stuff into prompt → call Gemini → return text
 - [ ] Every answer includes at least one citation with a link
 - [ ] Deployed on Vercel
