@@ -13,18 +13,12 @@ const BATCH_SIZE = 20;
 // ---------------------------------------------------------------------------
 // STEP 1: Parse YAML frontmatter
 // ---------------------------------------------------------------------------
-// Your version was close — two fixes:
-//   1. line.split(":") breaks on URLs (they have colons in "https://").
-//      Fix: split only on the FIRST colon using indexOf.
-//   2. You returned only metadata, but we also need the content.
-//      Fix: return { metadata, content }.
 
 function parseFrontmatter(raw: string) {
   const parts = raw.split("---");
 
   const yamlBlock = parts[1].trim();
-  // parts.slice(2).join("---") handles the edge case where the content
-  // itself contains "---" (it would get split into extra parts)
+
   const content = parts.slice(2).join("---").trim();
 
   const yamlLines = yamlBlock.split("\n");
@@ -55,11 +49,6 @@ function parseFrontmatter(raw: string) {
 // ---------------------------------------------------------------------------
 // STEP 2: Chunk text
 // ---------------------------------------------------------------------------
-// Your version had the right idea (while loop + slice) but two bugs:
-//   1. end was always 499 instead of start + 500
-//      → every chunk ended at the same position, getting shorter and shorter
-//   2. start += 50 means step of 50, overlap of 450. Way too much.
-//      → should be start += 450 (step of 450 = overlap of 50)
 
 function chunkText(text: string): string[] {
   const chunkSize = 500;
@@ -68,14 +57,14 @@ function chunkText(text: string): string[] {
   let start = 0;
 
   while (start < text.length) {
-    const end = start + chunkSize;       // ← was: end = 499 (fixed)
+    const end = start + chunkSize;
     const chunk = text.slice(start, end).trim();
 
     if (chunk.length >= 50) {
       chunks.push(chunk);
     }
 
-    start += chunkSize - overlap;        // ← was: start += 50 (fixed: 500-50=450)
+    start += chunkSize - overlap;
   }
 
   return chunks;
@@ -84,23 +73,19 @@ function chunkText(text: string): string[] {
 // ---------------------------------------------------------------------------
 // STEP 3: Embed via Gemini
 // ---------------------------------------------------------------------------
-// Your version was almost right — three fixes:
-//   1. Body key should be "requests" (plural), not "request"
-//   2. API key was missing from the URL (?key=...)
-//   3. Response field is "embeddings" (plural), not "embedding"
 
 const GEMINI_EMBED_URL =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents";
 
 async function embedBatch(texts: string[]): Promise<number[][]> {
-  const requests = texts.map((text) => ({     // ← was: "request" (fixed: "requests")
+  const requests = texts.map((text) => ({
     model: "models/gemini-embedding-001",
     content: { parts: [{ text }] },
   }));
 
-  const body = { requests };                  // ← key is "requests" plural
+  const body = { requests };
 
-  const response = await fetch(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {  // ← added ?key=
+  const response = await fetch(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
