@@ -13,10 +13,14 @@ const globalForDb = globalThis as unknown as { sql: ReturnType<typeof postgres> 
 const sql =
   globalForDb.sql ??
   postgres({
-    host: "db.rwhcwuzvuvjwipbdgivu.supabase.co",
-    port: 5432,
+    host: process.env.NODE_ENV === "production"
+      ? "aws-0-eu-west-1.pooler.supabase.com"
+      : "db.rwhcwuzvuvjwipbdgivu.supabase.co",
+    port: process.env.NODE_ENV === "production" ? 6543 : 5432,
     database: "postgres",
-    username: "postgres",
+    username: process.env.NODE_ENV === "production"
+      ? "postgres.rwhcwuzvuvjwipbdgivu"
+      : "postgres",
     password: process.env.SUPABASE_DB_PASSWORD!,
     ssl: "require",
   });
