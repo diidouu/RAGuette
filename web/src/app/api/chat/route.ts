@@ -140,13 +140,15 @@ Question : ${question}`;
 }
 
 // =============================================================================
-// STEP 4: CALL GEMINI TO GENERATE THE ANSWER
+// STEP 4: CALL GEMINI — STREAMING
 // =============================================================================
-// We use the Gemini REST API directly (no SDK). The model receives our system
-// instruction + user message and returns a text response.
+// Instead of generateContent (waits for everything), we call
+// streamGenerateContent?alt=sse. This opens an SSE (Server-Sent Events)
+// connection: Gemini sends us small JSON chunks as it generates each token.
 //
-// We use gemini-2.0-flash because it's fast, free-tier eligible, and good
-// enough for v0.1. We can swap to a better model later.
+// We return the raw Response from Gemini. The POST handler below will read
+// this stream, extract the text tokens, and re-stream them to the browser.
+// Think of it as: this function opens the tap, POST() connects the hose.
 
 const MODELS = [
   "gemini-2.5-flash",
@@ -154,7 +156,7 @@ const MODELS = [
   "gemini-3-flash-preview",
 ];
 
-async function generateAnswer(prompt: PromptMessages): Promise<string> {
+async function streamFromGemini(prompt: PromptMessages): Promise<Response> {
   const body = JSON.stringify({
     system_instruction: {
       parts: [{ text: prompt.systemInstruction }],
@@ -172,7 +174,8 @@ async function generateAnswer(prompt: PromptMessages): Promise<string> {
   });
 
   for (const model of MODELS) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+    // Key difference: streamGenerateContent + alt=sse instead of generateContent
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -189,23 +192,28 @@ async function generateAnswer(prompt: PromptMessages): Promise<string> {
       throw new Error(`Gemini generation failed: ${response.status} — ${err}`);
     }
 
-    const data = await response.json();
-    return data.candidates[0].content.parts[0].text;
+    // Return the raw response — its body is an SSE stream we'll read in POST()
+    return response;
   }
 
   throw new Error("All Gemini models are currently unavailable. Please try again later.");
 }
 
 // =============================================================================
-// STEP 5: THE ROUTE HANDLER
+// STEP 5: THE ROUTE HANDLER — STREAMING
 // =============================================================================
-// This is the actual Next.js API route. It orchestrates all the steps above:
-// 1. Parse the request body
-// 2. Embed the question
-// 3. Retrieve relevant chunks
-// 4. Build the prompt
-// 5. Generate the answer
-// 6. Return the answer + source metadata
+// This handler now returns a streaming response instead of waiting for
+// everything. Here's the flow:
+//
+//   Browser ←──SSE──── Our API ←──SSE──── Gemini
+//
+// We read Gemini's SSE stream, extract the text from each event, and re-emit
+// it to the browser as our own SSE events. At the end we send the sources.
+//
+// Our SSE protocol to the frontend is simple:
+//   data: {"type":"token","text":"Les"}        ← one per token chunk
+//   data: {"type":"sources","sources":[...]}   ← one at the very end
+//   data: [DONE]                               ← signals end of stream
 
 export async function POST(request: NextRequest) {
   try {
@@ -219,19 +227,15 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 1. Embed the question
+    // Steps 1-3 are identical to before — they don't need streaming
     const embedding = await embedQuery(message);
-
-    // 2. Find the most relevant chunks
     const chunks = await retrieveChunks(embedding);
-
-    // 3. Build the prompt with context
     const prompt = buildPrompt(message, chunks);
 
-    // 4. Generate the answer
-    const answer = await generateAnswer(prompt);
+    // Step 4: Open the streaming connection to Gemini
+    const geminiResponse = await streamFromGemini(prompt);
 
-    // 5. Return answer + sources for the frontend to render citations
+    // Prepare sources now (we already have the chunks), send them at the end
     const sources = chunks.map((chunk, i) => ({
       number: i + 1,
       title: chunk.source_title,
@@ -239,7 +243,81 @@ export async function POST(request: NextRequest) {
       fetched_at: chunk.fetched_at,
     }));
 
-    return NextResponse.json({ answer, sources });
+    // Step 5: Create a ReadableStream — our "conveyor belt"
+    // It reads from Gemini's SSE stream and re-emits to the browser.
+    const encoder = new TextEncoder();
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        // --- Read Gemini's SSE stream ---
+        // Gemini sends us lines like:
+        //   data: {"candidates":[{"content":{"parts":[{"text":"Les"}]}}]}
+        //
+        // We need to:
+        // 1. Read the raw bytes from Gemini's response body
+        // 2. Decode them into text
+        // 3. Split by lines, find lines starting with "data: "
+        // 4. Parse the JSON, extract the text
+        // 5. Re-emit as our own SSE event to the browser
+
+        const reader = geminiResponse.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = ""; // Lines can be split across chunks, so we buffer
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+
+            // Process complete lines (split by newline)
+            // A line is complete when we see \n — we handle \r\n too
+            const lines = buffer.split(/\r?\n/);
+            // Last element might be incomplete — keep it in the buffer
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              // SSE format: lines starting with "data: " contain the payload
+              // Empty lines are just event separators — skip them
+              if (!line.startsWith("data: ")) continue;
+
+              const jsonStr = line.slice(6); // Remove "data: " prefix
+              try {
+                const parsed = JSON.parse(jsonStr);
+                const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (text) {
+                  const sseEvent = `data: ${JSON.stringify({ type: "token", text })}\n\n`;
+                  controller.enqueue(encoder.encode(sseEvent));
+                }
+              } catch {
+                // Skip malformed JSON (keep-alive pings, etc.)
+              }
+            }
+          }
+
+          // --- Stream is done, send sources and close ---
+          const sourcesEvent = `data: ${JSON.stringify({ type: "sources", sources })}\n\n`;
+          controller.enqueue(encoder.encode(sourcesEvent));
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+
+        } catch (err) {
+          controller.error(err);
+        }
+      },
+    });
+
+    // Return the stream as an SSE response
+    // These headers tell the browser: "this is a stream, don't buffer it"
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",   // SSE content type
+        "Cache-Control": "no-cache",            // Don't cache the stream
+        Connection: "keep-alive",               // Keep the connection open
+      },
+    });
+
   } catch (error) {
     console.error("Chat API error:", error);
     return NextResponse.json(

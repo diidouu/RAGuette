@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 
 // =============================================================================
 // TYPES
@@ -30,6 +30,49 @@ export default function Home() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // --- Typewriter queue ---
+  // When Gemini sends a big chunk ("Les cotisations sociales s'élèvent..."),
+  // we don't dump it into the message all at once. Instead we push the
+  // characters into this queue, and a timer drains it char by char.
+  // This gives a smooth typing effect even when Gemini sends fat chunks.
+  const charQueueRef = useRef<string[]>([]);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pendingSourcesRef = useRef<Source[] | null>(null);
+  const streamDoneRef = useRef(false);
+
+  // Append one character from the queue to the last message
+  const drainOneChar = useCallback(() => {
+    if (charQueueRef.current.length > 0) {
+      // Pull characters in small batches (3 at a time) for speed
+      // Pure char-by-char at 15ms = 66 chars/sec which feels too slow
+      // 3 chars × 66 ticks/sec = ~200 chars/sec — snappy but readable
+      const batch = charQueueRef.current.splice(0, 3).join("");
+      setMessages((prev) => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        updated[updated.length - 1] = { ...last, content: last.content + batch };
+        return updated;
+      });
+    } else if (streamDoneRef.current) {
+      // Queue is empty and stream is done — attach sources and stop
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      if (pendingSourcesRef.current) {
+        const sources = pendingSourcesRef.current;
+        pendingSourcesRef.current = null;
+        setMessages((prev) => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          updated[updated.length - 1] = { ...last, sources };
+          return updated;
+        });
+      }
+      setIsLoading(false);
+    }
+  }, []);
+
   // Auto-scroll to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -48,11 +91,19 @@ export default function Home() {
     const trimmed = input.trim();
     if (!trimmed || isLoading) return;
 
-    // Add user message
+    // Reset typewriter state
+    charQueueRef.current = [];
+    pendingSourcesRef.current = null;
+    streamDoneRef.current = false;
+
+    // Add user message + an empty assistant message that we'll fill char by char
     const userMessage: Message = { role: "user", content: trimmed };
-    setMessages((prev) => [...prev, userMessage]);
+    setMessages((prev) => [...prev, userMessage, { role: "assistant", content: "" }]);
     setInput("");
     setIsLoading(true);
+
+    // Start the typewriter timer — drains the queue every 15ms
+    intervalRef.current = setInterval(drainOneChar, 15);
 
     try {
       const res = await fetch("/api/chat", {
@@ -63,19 +114,64 @@ export default function Home() {
 
       if (!res.ok) throw new Error("API error");
 
-      const data = await res.json();
-      const assistantMessage: Message = {
-        role: "assistant",
-        content: data.answer,
-        sources: data.sources,
-      };
-      setMessages((prev) => [...prev, assistantMessage]);
+      // --- Read the SSE stream ---
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const events = buffer.split("\n\n");
+        buffer = events.pop() || "";
+
+        for (const event of events) {
+          for (const line of event.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6);
+            if (payload === "[DONE]") break;
+
+            try {
+              const parsed = JSON.parse(payload);
+
+              if (parsed.type === "token") {
+                // Push characters into the queue — the timer will drain them
+                charQueueRef.current.push(...parsed.text.split(""));
+              }
+
+              if (parsed.type === "sources") {
+                // Hold sources until the typewriter finishes
+                pendingSourcesRef.current = parsed.sources;
+              }
+            } catch {
+              // Skip malformed events
+            }
+          }
+        }
+      }
+
+      // Stream is done — tell the timer to stop once queue is empty
+      streamDoneRef.current = true;
+
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "Désolé, une erreur est survenue. Réessayez." },
-      ]);
-    } finally {
+      // Stop typewriter on error
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      setMessages((prev) => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        if (last?.role === "assistant") {
+          updated[updated.length - 1] = { ...last, content: "Désolé, une erreur est survenue. Réessayez." };
+        } else {
+          updated.push({ role: "assistant", content: "Désolé, une erreur est survenue. Réessayez." });
+        }
+        return updated;
+      });
       setIsLoading(false);
     }
   }
@@ -126,7 +222,7 @@ export default function Home() {
             {messages.map((msg, i) => (
               <MessageBubble key={i} message={msg} />
             ))}
-            {isLoading && <TypingIndicator />}
+            {isLoading && messages[messages.length - 1]?.content === "" && <TypingIndicator />}
             <div ref={messagesEndRef} />
           </div>
         )}
@@ -250,6 +346,9 @@ function SuggestionChip({ text, onSelect }: { text: string; onSelect: (text: str
 
 function MessageBubble({ message }: { message: Message }) {
   const isUser = message.role === "user";
+
+  // Don't render empty assistant bubbles (they're placeholders for streaming)
+  if (!isUser && !message.content && !message.sources?.length) return null;
 
   return (
     <div
